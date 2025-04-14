@@ -1,81 +1,107 @@
-import requests
+import torch
+from torch.utils.data import Dataset, DataLoader
+from sentence_transformers import SentenceTransformer
+from sklearn.model_selection import train_test_split
+import json
 import pandas as pd
-import re
-import time
+from collections import defaultdict
 
-with open("tmdb_api_key.txt", "r") as f:
-    TMDB_API_KEY = f.read()
-DELAY = 1
+# Custom MovieLens Dataset
+class MovieLens(Dataset):
+    def __init__(self, data, movies, embeddings):
+        self.data = data
+        self.movies = movies
+        self.embeddings = embeddings
 
-def get_tmdb_id(title):
-    search_url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={title}"
-    
-    time.sleep(DELAY)
+    def __len__(self):
+        return len(self.data)
 
-    response = requests.get(search_url)
-    data = response.json()
-    
-    if data["results"]:
-        return data["results"][0]["id"]  # Return the first movie's ID on tmdb
+    def __getitem__(self, index):
+        user_id = self.data.iloc[index]['userId'] - 1
+        movie_id = self.data.iloc[index]['movieId']
+        embedding = self.embeddings.get(movie_id, torch.zeros(384))
+        rating = self.data.iloc[index]['rating']
+
+        return {
+            'user_id': torch.tensor(user_id, dtype=torch.long),
+            'movie_id': torch.tensor(movie_id, dtype=torch.long),
+            'embedding': torch.tensor(embedding, dtype=torch.float),
+            'rating': torch.tensor(rating, dtype=torch.float)
+        }
+
+def createDataset(loaded = True):
+    ratings = pd.read_csv('ratings.dat', delimiter='::', names=['userId', 'movieId', 'rating', 'timestamp'], engine='python')
+    movies = pd.read_csv('movies_desc.dat', delimiter='::', names=['movieId', 'title', 'year', 'genres','description'], engine='python')
+
+    print(len(movies))
+    print(movies.head())
+    print(len(ratings))
+    print(ratings.head())
+    print("Raw Data Read")
+
+
+    if not loaded:
+      encoder = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+      embeddings = getAllEmbeddings(encoder, movies.to_dict('records'))
     else:
-        return None
+      with open("movie_embeddings.json", "r") as f:
+        embeddings = json.load(f)
 
-def read_movies():
-    movies = []
-    with open("movielens-1m/movies.dat", "r") as f:
-        data = f.readlines()
+    print("Embeddings generated")
 
-    for mov in data:
-        l = mov.strip().split("::")
-        
-        match = re.match(r"^(.*?)\s*(?:\([^)]+\))?\s*\((\d{4})\)$", l[1])
+    train_data, test_data = train_test_split(ratings, test_size=0.2, random_state=42)
+    train_data, val_data = train_test_split(train_data, test_size=0.2, random_state=42)
 
-        if match:
-            title = match.group(1).strip()
-            year = match.group(2).strip()
-            movie_dict = {"movieID": l[0], "title":title, "year": year,"genres":l[2]} 
-            movies.append(movie_dict)
-        else:
-            print(f"{l[1]} match NOT FOUND")
-    return movies
-        
-def fetch_description(id):
-    fetch_url = f"https://api.themoviedb.org/3/movie/{id}?api_key={TMDB_API_KEY}"
-    
-    time.sleep(DELAY)
+    print("Data has been split")
 
-    response = requests.get(fetch_url)
-    data = response.json()
-    
-    return data.get("overview", "NOT FOUND")
+    train_dataset = MovieLens(train_data, movies, embeddings)
+    val_dataset = MovieLens(val_data, movies, embeddings)
+    test_dataset = MovieLens(test_data, movies, embeddings)
 
-def generate_descriptions():
-    movies = read_movies()
-    print("Read movies.dat...")
+    print("Datasets created")
 
-    for mov in movies:
-        mov_id = get_tmdb_id(mov["title"])
-        if mov_id == None:
-            print(f"{mov['title']} ID NOT FOUND")
-            mov["description"] = "ID NOT FOUND"
-            continue
-        
-        description = fetch_description(mov_id)
-        mov["description"] = description
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
-    print("Writing to movies_desc.dat...")
+    print("DataLoaders created")
 
-    with open("movielens-1m/movies_desc.dat", "w", encoding="utf-8") as f:
-        for mov in movies:
-            f.write(mov["movieID"] + "::" + mov["title"] + "::" + mov["year"] + "::" + mov["genres"] + "::" + mov["description"] + "\n")
+    return train_dataset, val_dataset, test_dataset, train_loader, val_loader, test_loader
 
-    return
+# Generate Movie Embeddings to set up MovieLens dataset
+def getAllEmbeddings(encoder, movies, filename):
+  embeddings = {}
+  for mov in movies:
+    parts = (
+        f"Movie title: {mov['title']} ({mov['year']}).",
+        f"Genres: {(mov['genres'])}. ",
+        f"Description: {mov['description']}"
+    )
+    movie_text = '. '.join([part for part in parts if part]).strip()
 
-if __name__=="__main__":
-    print("Starting data preprocessing...")
-    
-    start = time.time()
-    generate_descriptions()
-    end = time.time()
+    embedding = encoder.encode(movie_text)
+    embeddings[int(mov["movieId"])] = embedding.tolist()
 
-    print(f"Data Processing took {(end-start):.2f} seconds.")
+  with open(f"{filename}.json", "w") as f:
+    json.dump(embeddings, f)
+
+  print(f"Embeddings saved to {filename}.json")
+
+  return embeddings
+
+def build_user_positive_dict(dataset):
+    user_pos = defaultdict(set)
+    for data in dataset:
+        uid = int(data['user_id']) 
+        mid = int(data['movie_id'])  
+        rating = float(data['rating'])
+        if rating >= 2:
+            user_pos[uid].add(mid)  #add to set instead of overwriting
+    return user_pos
+
+def build_user_negative_dict(all_movie_ids, user_positive_dict):
+    user_neg = {}
+    all_movies_set = set(all_movie_ids)
+    for uid, pos_movies in user_positive_dict.items():
+        user_neg[uid] = list(all_movies_set - pos_movies)
+    return user_neg
