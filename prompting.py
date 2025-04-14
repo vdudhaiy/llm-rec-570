@@ -5,8 +5,6 @@ import time
 import os
 import pandas as pd
 
-os.environ['HF_TOKEN']='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'
-
 # Global Variables
 TEMPERATURE = 0.7
 MAX_NEW_TOKENS = 200
