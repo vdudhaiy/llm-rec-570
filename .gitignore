@@ -1,1 +1,7 @@
 *.txt
+!requirements.txt
+venv/
+__pycache__/
+.env
+movielens-1m/
+*.dat
