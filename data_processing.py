@@ -10,7 +10,8 @@ import logging
 from config import (
     RATINGS_FILE, MOVIES_DESC_FILE, EMBEDDINGS_FILE,
     EMBEDDING_MODEL, EMBEDDING_DIM, TEST_SIZE, VAL_SIZE,
-    POSITIVE_RATING_THRESHOLD, RANDOM_SEED, VERBOSE, SELECTED_EMBEDDINGS_FILE
+    POSITIVE_RATING_THRESHOLD, RANDOM_SEED, VERBOSE, SELECTED_EMBEDDINGS_FILE,
+    BATCH_SIZE, NUM_WORKERS, PIN_MEMORY, SUBSAMPLE_FRAC, get_device
 )
 
 # Set seeds for reproducibility
@@ -29,6 +30,32 @@ class MovieLens(Dataset):
         self.embeddings = embeddings
         self.expected_embedding_dim = expected_embedding_dim
         self._validate_embeddings()
+
+        # Pull the three columns we need out of pandas once, up front.
+        # The previous version called data.iloc[index] three times per sample,
+        # which dominated the runtime of every epoch.
+        self.user_ids = torch.as_tensor(data['userId'].to_numpy(), dtype=torch.long) - 1
+        self.movie_ids = torch.as_tensor(data['movieId'].to_numpy(), dtype=torch.long)
+        self.ratings = torch.as_tensor(data['rating'].to_numpy(), dtype=torch.float)
+
+        # Dense embedding matrix indexed by movie id, so lookup is a tensor index
+        # instead of a Python dict hit per sample. Unknown movies stay all-zero.
+        max_movie_id = int(self.movie_ids.max().item())
+        if embeddings:
+            max_movie_id = max(max_movie_id, max(int(k) for k in embeddings))
+        self.embedding_matrix = torch.zeros(max_movie_id + 1, expected_embedding_dim, dtype=torch.float)
+        for mid, vec in embeddings.items():
+            self.embedding_matrix[int(mid)] = torch.as_tensor(vec, dtype=torch.float)
+
+        known = torch.as_tensor(sorted(int(k) for k in embeddings), dtype=torch.long)
+        self.has_embedding = torch.zeros(max_movie_id + 1, dtype=torch.bool)
+        self.has_embedding[known] = True
+        missing = int((~self.has_embedding[self.movie_ids]).sum().item())
+        if missing:
+            logger.warning(
+                f"{missing}/{len(self.movie_ids)} interactions reference movies with no "
+                f"embedding; those fall back to a zero vector"
+            )
 
     def _validate_embeddings(self):
         """Validate that embeddings have correct dimension"""
@@ -52,16 +79,13 @@ class MovieLens(Dataset):
         return len(self.data)
 
     def __getitem__(self, index):
-        user_id = self.data.iloc[index]['userId'] - 1
-        movie_id = self.data.iloc[index]['movieId']
-        embedding = self.embeddings.get(movie_id, torch.zeros(self.expected_embedding_dim))
-        rating = self.data.iloc[index]['rating']
+        movie_id = self.movie_ids[index]
 
         return {
-            'user_id': torch.tensor(user_id, dtype=torch.long),
-            'movie_id': torch.tensor(movie_id, dtype=torch.long),
-            'embedding': torch.tensor(embedding, dtype=torch.float),
-            'rating': torch.tensor(rating, dtype=torch.float)
+            'user_id': self.user_ids[index],
+            'movie_id': movie_id,
+            'embedding': self.embedding_matrix[movie_id],
+            'rating': self.ratings[index]
         }
 
 def createDataset(loaded=True):
@@ -72,13 +96,17 @@ def createDataset(loaded=True):
     except FileNotFoundError as e:
         raise FileNotFoundError(f"Data file not found: {e}")
     
+    if 0 < SUBSAMPLE_FRAC < 1.0:
+        ratings = ratings.sample(frac=SUBSAMPLE_FRAC, random_state=RANDOM_SEED).reset_index(drop=True)
+        logger.info(f"Subsampled ratings to {SUBSAMPLE_FRAC:.3f} of the file: {len(ratings)} rows")
+
     logger.info(f"Loaded {len(movies)} movies and {len(ratings)} ratings")
     logger.info(f"Movies sample:\n{movies.head()}")
     logger.info(f"Ratings sample:\n{ratings.head()}")
 
     if not loaded:
         logger.info(f"Generating embeddings using {EMBEDDING_MODEL}...")
-        encoder = SentenceTransformer(EMBEDDING_MODEL)
+        encoder = SentenceTransformer(EMBEDDING_MODEL, device=str(get_device()))
         embeddings = getAllEmbeddings(encoder, movies.to_dict('records'))
     else:
         logger.info(f"Loading pre-computed embeddings from {SELECTED_EMBEDDINGS_FILE}...")
@@ -128,32 +156,41 @@ def createDataset(loaded=True):
 
     logger.info("Datasets created successfully")
 
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+    pin = PIN_MEMORY and get_device().type == "cuda"
+    loader_kwargs = {"batch_size": BATCH_SIZE, "num_workers": NUM_WORKERS, "pin_memory": pin}
+    if NUM_WORKERS > 0:
+        loader_kwargs["persistent_workers"] = True
+
+    train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
 
     logger.info("DataLoaders created successfully")
 
     return train_dataset, val_dataset, test_dataset, train_loader, val_loader, test_loader
 
 # Generate Movie Embeddings to set up MovieLens dataset
-def getAllEmbeddings(encoder, movies):
-  embeddings = {}
+def getAllEmbeddings(encoder, movies, output_file=EMBEDDINGS_FILE, batch_size=256):
+  """Encode every movie's text in one batched GPU pass instead of one call per movie."""
+  texts = []
+  movie_ids = []
   for mov in movies:
     parts = (
         f"Movie title: {mov['title']} ({mov['year']}).",
         f"Genres: {(mov['genres'])}. ",
         f"Description: {mov['description']}"
     )
-    movie_text = '. '.join([part for part in parts if part]).strip()
+    texts.append('. '.join([part for part in parts if part]).strip())
+    movie_ids.append(int(mov["movieId"]))
 
-    embedding = encoder.encode(movie_text)
-    embeddings[int(mov["movieId"])] = embedding.tolist()
+  encoded = encoder.encode(texts, batch_size=batch_size, show_progress_bar=VERBOSE,
+                           convert_to_numpy=True)
+  embeddings = {mid: vec.tolist() for mid, vec in zip(movie_ids, encoded)}
 
-  with open(EMBEDDINGS_FILE, "w") as f:
+  with open(output_file, "w") as f:
     json.dump(embeddings, f)
 
-  logger.info(f"Embeddings saved to {EMBEDDINGS_FILE}")
+  logger.info(f"Embeddings saved to {output_file}")
 
   return embeddings
 

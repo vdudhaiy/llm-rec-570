@@ -1,11 +1,17 @@
+import argparse
 import requests
 import pandas as pd
 import re
 import time
 import random
 import logging
+
+from checkpoint import load_dat_rows, save_dat_rows, is_placeholder, CHECKPOINT_EVERY
+
+# MovieLens-1M is distributed in ISO-8859-1.
+MOVIELENS_ENCODING = "latin-1"
 from config import (
-    TMDB_API_KEY_FILE, TMDB_INITIAL_DELAY, TMDB_MAX_RETRIES,
+    TMDB_API_KEY, TMDB_INITIAL_DELAY, TMDB_MAX_RETRIES,
     TMDB_INITIAL_BACKOFF, TMDB_MAX_BACKOFF, RANDOM_SEED,
     MOVIES_FILE, MOVIES_DESC_FILE, VERBOSE
 )
@@ -17,17 +23,13 @@ random.seed(RANDOM_SEED)
 logging.basicConfig(level=logging.INFO if VERBOSE else logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Load and validate TMDB API key
-try:
-    with open(TMDB_API_KEY_FILE, "r") as f:
-        TMDB_API_KEY = f.read().strip()
-    if not TMDB_API_KEY:
-        raise ValueError("TMDB_API_KEY is empty")
-    logger.info(f"Loaded TMDB API key (first 10 chars: {TMDB_API_KEY[:10]}...)")
-except FileNotFoundError:
-    raise FileNotFoundError(f"TMDB API key file not found: {TMDB_API_KEY_FILE}")
-except Exception as e:
-    raise Exception(f"Error loading TMDB API key: {e}")
+# config.py already resolves the key from TMDB_API_KEY (or TMDB_API_KEY_FILE).
+# Importing this module must not explode when the key is absent - only calling
+# generate_descriptions() actually needs it.
+if not TMDB_API_KEY:
+    logger.warning("TMDB_API_KEY is not set; generate_descriptions() will raise if called")
+else:
+    logger.info(f"Loaded TMDB API key (first 4 chars: {TMDB_API_KEY[:4]}...)")
 
 INITIAL_DELAY = TMDB_INITIAL_DELAY
 last_request_time = 0.0
@@ -100,8 +102,10 @@ def get_tmdb_id(title):
 def read_movies():
     """Read and parse movies from MovieLens dataset with column name standardization"""
     movies = []
+    # MovieLens-1M ships as ISO-8859-1, not UTF-8. Titles like
+    # "Mis\xe9rables, Les (1995)" make a UTF-8 read raise UnicodeDecodeError.
     try:
-        with open(MOVIES_FILE, "r", encoding="utf-8") as f:
+        with open(MOVIES_FILE, "r", encoding=MOVIELENS_ENCODING) as f:
             data = f.readlines()
     except FileNotFoundError:
         raise FileNotFoundError(f"Movies file not found: {MOVIES_FILE}")
@@ -137,58 +141,127 @@ def fetch_description(movie_id):
     try:
         response = api_call_with_retry(fetch_url)
         data = response.json()
-        return data.get("overview", "NOT FOUND")
+        overview = (data.get("overview") or "").strip()
+        # Record an explicit marker rather than "": a blank would be
+        # indistinguishable from a movie that was never looked up.
+        return overview if overview else "NOT_FOUND"
     except Exception as e:
         logger.error(f"Error fetching description for movie ID {movie_id}: {e}")
         return "ERROR FETCHING"
 
-def generate_descriptions():
-    """Fetch descriptions for all movies from TMDB"""
+def _require_api_key():
+    if not TMDB_API_KEY:
+        raise ValueError(
+            "TMDB_API_KEY not found. Set it in .env (or point TMDB_API_KEY_FILE at a file) "
+            "before fetching descriptions."
+        )
+
+
+def generate_descriptions(force=False, retry_failed=True):
+    """
+    Fetch descriptions for all movies from TMDB, resuming from any partial run.
+
+    Two API calls per movie (title lookup, then details) over 3883 movies is around
+    half an hour of network time. The previous version held everything in memory and
+    wrote once at the very end, so an interruption at movie 3800 saved nothing. Now
+    results are checkpointed to disk as they arrive and a rerun fetches only what is
+    still missing.
+
+    Args:
+        force: Ignore the existing file and refetch every movie
+        retry_failed: Also refetch movies previously recorded as NOT_FOUND/ERROR
+
+    Returns:
+        dict: movieId (str) -> description
+    """
+    _require_api_key()
     movies = read_movies()
-    logger.info("Starting description fetching...")
-    
+    total = len(movies)
+
+    descriptions = {} if force else load_dat_rows(MOVIES_DESC_FILE)
+    if force:
+        logger.info(f"--force: refetching all {total} descriptions")
+
+    todo = []
+    retrying = 0
+    for mov in movies:
+        mid = str(mov["movieId"])
+        if mid not in descriptions:
+            # No row at all: this movie has never been looked up.
+            todo.append(mov)
+        elif is_placeholder(descriptions[mid]) and retry_failed:
+            # A row exists but holds nothing usable - a completed attempt that
+            # failed, so only redo it when explicitly asked.
+            todo.append(mov)
+            retrying += 1
+
+    if not todo:
+        logger.info(f"Nothing to fetch: {MOVIES_DESC_FILE} already covers all {total} movies")
+        return descriptions
+
+    done = total - len(todo)
+    if done:
+        msg = f"Resuming: {done}/{total} descriptions already fetched, {len(todo)} to go"
+        if retrying:
+            msg += f" (including {retrying} previously-failed entries being retried)"
+        logger.info(msg)
+    else:
+        logger.info(f"Fetching all {total} descriptions from TMDB...")
+
     successful = 0
     failed = 0
-    not_found = 0
+    completed = 0
 
-    for i, mov in enumerate(movies):
-        logger.info(f"Processing movie {i+1}/{len(movies)}: {mov['title']}")
-        
-        mov_id = get_tmdb_id(mov["title"])
-        if mov_id is None:
-            logger.warning(f"TMDB ID not found: {mov['title']}")
-            mov["description"] = "NOT_FOUND"
-            not_found += 1
-            continue
-        
-        description = fetch_description(mov_id)
-        mov["description"] = description
-        
-        if description in ["NOT_FOUND", "ERROR FETCHING"]:
-            failed += 1
-        else:
-            successful += 1
-
-    logger.info(f"Description fetching complete: {successful} successful, {failed} failed, {not_found} not found")
-    
-    logger.info(f"Writing to {MOVIES_DESC_FILE}...")
-    
     try:
-        with open(MOVIES_DESC_FILE, "w", encoding="utf-8") as f:
-            for mov in movies:
-                f.write(f"{mov['movieId']}::{mov['title']}::{mov['year']}::{mov['genres']}::{mov['description']}\n")
-        logger.info(f"Descriptions saved to {MOVIES_DESC_FILE}")
-    except Exception as e:
-        logger.error(f"Error writing descriptions file: {e}")
-        raise
+        for position, mov in enumerate(todo, start=1):
+            mid = str(mov["movieId"])
+            logger.info(f"[{position}/{len(todo)}] {mov['title']}")
 
-    return
+            tmdb_id = get_tmdb_id(mov["title"])
+            if tmdb_id is None:
+                logger.warning(f"TMDB ID not found: {mov['title']}")
+                descriptions[mid] = "NOT_FOUND"
+                failed += 1
+            else:
+                description = fetch_description(tmdb_id)
+                descriptions[mid] = description
+                if is_placeholder(description):
+                    failed += 1
+                else:
+                    successful += 1
 
-if __name__=="__main__":
+            completed += 1
+            if completed % CHECKPOINT_EVERY == 0:
+                save_dat_rows(MOVIES_DESC_FILE, movies, descriptions)
+                logger.info(f"  checkpoint: {position}/{len(todo)} saved to {MOVIES_DESC_FILE}")
+    finally:
+        # Bank whatever finished, including on Ctrl-C or an unhandled error.
+        save_dat_rows(MOVIES_DESC_FILE, movies, descriptions)
+
+    remaining = sum(1 for mov in movies if is_placeholder(descriptions.get(str(mov["movieId"]))))
+    logger.info(f"Fetch complete: {successful} succeeded, {failed} failed this run")
+    logger.info(f"{MOVIES_DESC_FILE} now has {total - remaining}/{total} usable descriptions")
+    if remaining:
+        logger.warning(f"{remaining} movies still have no description; rerun to retry just those")
+
+    return descriptions
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Fetch movie synopses from TMDB. Resumes automatically: movies "
+                    "that already have a description are skipped."
+    )
+    parser.add_argument('--force', action='store_true',
+                        help='Ignore the existing file and refetch every movie')
+    parser.add_argument('--no-retry-failed', action='store_true',
+                        help='Leave previously-failed entries alone instead of retrying')
+    args = parser.parse_args()
+
     logger.info("Starting TMDB description fetching...")
-    
+
     start = time.time()
-    generate_descriptions()
+    generate_descriptions(force=args.force, retry_failed=not args.no_retry_failed)
     end = time.time()
 
     logger.info(f"TMDB description fetching took {(end-start):.2f} seconds.")

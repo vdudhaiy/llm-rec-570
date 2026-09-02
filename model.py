@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import logging
 
+from config import ATTENTION_HEADS, DROPOUT_RATE
+
 logger = logging.getLogger(__name__)
 
 
@@ -22,6 +24,7 @@ class EarlyStopping:
         self.best_loss = float("inf")
         self.counter = 0
         self.patience = patience
+        self.improved = False
 
     def check_loss(self, loss):
         """
@@ -36,9 +39,11 @@ class EarlyStopping:
         if loss < self.best_loss:
             self.best_loss = loss
             self.counter = 0
+            self.improved = True
             logger.debug(f"New best loss: {loss:.4f}")
             return True
         else:
+            self.improved = False
             self.counter += 1
             logger.debug(f"No improvement. Patience: {self.counter}/{self.patience}")
             
@@ -80,7 +85,7 @@ class SimpleCF(nn.Module):
         # Output layer
         self.linear = nn.Linear(embedding_dim * 2, 1)
         
-    def forward(self, user_id, movie_id, mov_embedding=None):
+    def forward(self, user_id, movie_id, mov_embedding=None, return_attention=False):
         """
         Forward pass computing interaction scores.
         
@@ -88,26 +93,30 @@ class SimpleCF(nn.Module):
             user_id: User IDs (batch_size,) or (batch_size, 1)
             movie_id: Movie IDs (batch_size,) or (batch_size, 1)
             mov_embedding: Unused (for compatibility with LLMRec interface)
+            return_attention: Unused; SimpleCF has no attention layer
             
         Returns:
-            Predicted interaction scores (batch_size,) or (batch_size, 1)
+            Predicted interaction scores, always shape (batch_size,)
         """
-        # Ensure tensors are 1D for embedding lookup
-        user_id = user_id.squeeze()
-        movie_id = movie_id.squeeze()
-        
+        # reshape(-1) rather than squeeze(): squeeze() would also drop the batch
+        # dimension when the batch happens to contain a single example.
+        user_id = user_id.reshape(-1)
+        movie_id = movie_id.reshape(-1)
+
         user_emb = self.user_embedding(user_id)
         movie_emb = self.movie_embedding(movie_id)
-        
-        user_bias = self.user_bias(user_id).squeeze()
-        movie_bias = self.movie_bias(movie_id).squeeze()
-        
+
+        user_bias = self.user_bias(user_id).reshape(-1)
+        movie_bias = self.movie_bias(movie_id).reshape(-1)
+
         # Concatenate embeddings
         x = torch.cat([user_emb, movie_emb], dim=-1)
-        
+
         # Output
-        output = self.linear(x).squeeze() + user_bias + movie_bias + self.global_bias
-        
+        output = self.linear(x).reshape(-1) + user_bias + movie_bias + self.global_bias
+
+        if return_attention:
+            return output, None
         return output
 
 
@@ -135,9 +144,14 @@ class LLMRec(nn.Module):
         self.embedding_dim = embedding_dim
 
         # Attention layer - attends from user to movie embeddings
+        # The user embedding is the query; the movie's description views are the
+        # keys/values. With one view (types B/C/D) the softmax is over a sequence
+        # of length 1, so it is always 1.0 and this degenerates to a learned
+        # linear projection. With several views (type E) the softmax is a real
+        # choice: it learns, per user, which kind of description to trust.
         self.attention = nn.MultiheadAttention(
-            embed_dim=embedding_dim, 
-            num_heads=2, 
+            embed_dim=embedding_dim,
+            num_heads=ATTENTION_HEADS,
             batch_first=True
         )
 
@@ -151,32 +165,42 @@ class LLMRec(nn.Module):
         self.linear1 = nn.Linear(embedding_dim * 2, 256)
         self.ln1 = nn.LayerNorm(256)
         self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(0.4)
+        self.dropout = nn.Dropout(DROPOUT_RATE)
 
         self.linear2 = nn.Linear(256, 128)
         self.ln2 = nn.LayerNorm(128)
 
         self.linear3 = nn.Linear(128, 1)
 
-    def forward(self, user_id, movie_id, mov_embedding):
+    def forward(self, user_id, movie_id, mov_embedding, return_attention=False):
         """
         Forward pass computing interaction scores with attention.
-        
+
         Args:
             user_id: User IDs (batch_size, 1)
             movie_id: Movie IDs (batch_size, 1) - unused but kept for interface compatibility
-            mov_embedding: Movie text embeddings (batch_size, 1, embedding_dim)
-            
+            mov_embedding: Movie text embeddings (batch_size, num_views, embedding_dim).
+                           num_views is 1 for types B/C/D and >1 for type E.
+            return_attention: If True, also return the per-view attention weights
+
         Returns:
-            Predicted interaction scores (batch_size,) or (batch_size, 1)
+            Predicted interaction scores, shape (batch_size,).
+            If return_attention, a tuple (scores, weights) where weights has shape
+            (batch_size, num_views) and each row sums to 1.
         """
+        if user_id.dim() == 1:
+            user_id = user_id.unsqueeze(1)
+        if mov_embedding.dim() == 2:
+            mov_embedding = mov_embedding.unsqueeze(1)
         user_emb = self.user_embedding(user_id)  # (batch_size, 1, embedding_dim)
 
         # Project movie embeddings
         mov_proj = self.project_movie(mov_embedding)  # (batch_size, 1, embedding_dim)
 
-        # Apply attention: user embedding attends to movie embeddings
+        # Apply attention: the user embedding attends over the movie's views
         attn_output, attn_weights = self.attention(user_emb, mov_proj, mov_proj)
+        # attn_weights: (batch_size, 1 query, num_views) -> (batch_size, num_views)
+        attn_weights = attn_weights.squeeze(1)
         attn_output = attn_output.squeeze(1)  # (batch_size, embedding_dim)
         user_emb = user_emb.squeeze(1)  # (batch_size, embedding_dim)
 
@@ -194,6 +218,8 @@ class LLMRec(nn.Module):
         x = self.relu(x)
         x = self.dropout(x)
 
-        x = self.linear3(x)
+        x = self.linear3(x).reshape(-1)
 
+        if return_attention:
+            return x, attn_weights
         return x

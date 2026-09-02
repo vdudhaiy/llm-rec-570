@@ -1,7 +1,28 @@
-*.txt
-!requirements.txt
-venv/
+# Python
 __pycache__/
+venv/
+.venv/
+
+# Secrets
 .env
+
+# Datasets (download separately, see README)
 movielens-1m/
 *.dat
+
+# Run logs (bulky, regenerated each run). Result JSON under outputs/ IS tracked -
+# those are the deliverable.
+outputs/logs/
+
+# Generated artefacts: LLM descriptions and sentence embeddings
+basic_descriptions.txt
+recommendation_driven_descriptions.txt
+execution.log
+movie_embeddings.json
+embeddings_basic.json
+embeddings_rec_driven.json
+embeddings_combined.json
+embeddings_multiview.json
+
+# Logs
+*.log

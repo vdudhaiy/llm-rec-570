@@ -1,0 +1,77 @@
+{
+  "model_type": "B",
+  "model_description": "LLMRec with basic descriptions",
+  "embeddings_file": "movie_embeddings.json",
+  "device": "NVIDIA GeForce RTX 5070 Laptop GPU (sm_120, 11.9 GB, CUDA 12.8)",
+  "epochs_run": 5,
+  "train_seconds": 329.47,
+  "eval_num_negatives": 99,
+  "views": [
+    "single"
+  ],
+  "mean_attention_weights": null,
+  "test_metrics": {
+    "HR@10": 0.46599214165025343,
+    "MRR@10": 0.1951341255647868,
+    "NDCG@10": 0.2582218100734033
+  },
+  "average_test_loss": 0.1016996471660434,
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.2829419187646526,
+      "val_loss": 0.11324247845924254,
+      "val_metrics": {
+        "hr": 0.42019195920866814,
+        "mrr": 0.17474749404214243,
+        "ndcg": 0.2319935458219866
+      },
+      "seconds": 63.82144618034363
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.26891023537480546,
+      "val_loss": 0.1048480960020871,
+      "val_metrics": {
+        "hr": 0.4392316632715548,
+        "mrr": 0.18325069488262138,
+        "ndcg": 0.24293672619104095
+      },
+      "seconds": 66.02311372756958
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.2621029822317276,
+      "val_loss": 0.11092375950182914,
+      "val_metrics": {
+        "hr": 0.45802142044815475,
+        "mrr": 0.1905864650257401,
+        "ndcg": 0.25282008646995024
+      },
+      "seconds": 64.87822580337524
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.25669429174968034,
+      "val_loss": 0.10526515073317357,
+      "val_metrics": {
+        "hr": 0.46588225002187034,
+        "mrr": 0.1946192683923536,
+        "ndcg": 0.257777551817644
+      },
+      "seconds": 66.51794338226318
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.2534608225262095,
+      "val_loss": 0.10165164850677638,
+      "val_metrics": {
+        "hr": 0.46588849869402754,
+        "mrr": 0.19477617971103092,
+        "ndcg": 0.257888677842255
+      },
+      "seconds": 68.22650718688965
+    }
+  ],
+  "timestamp": "2026-08-31 18:12:11.909749"
+}

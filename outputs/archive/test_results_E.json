@@ -1,0 +1,81 @@
+{
+  "model_type": "E",
+  "model_description": "LLMRec with multi-view attention over each description separately",
+  "embeddings_file": "embeddings_multiview.json",
+  "device": "NVIDIA GeForce RTX 5070 Laptop GPU (sm_120, 11.9 GB, CUDA 12.8)",
+  "epochs_run": 5,
+  "train_seconds": 331.05,
+  "eval_num_negatives": 99,
+  "views": [
+    "original",
+    "basic"
+  ],
+  "mean_attention_weights": {
+    "original": 0.4964774549007416,
+    "basic": 0.503522515296936
+  },
+  "test_metrics": {
+    "HR@10": 0.4673618540106578,
+    "MRR@10": 0.1935124703486035,
+    "NDCG@10": 0.25727033068771654
+  },
+  "average_test_loss": 0.11019519153579074,
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.2827463561247602,
+      "val_loss": 0.11033365698652665,
+      "val_metrics": {
+        "hr": 0.42004199107689616,
+        "mrr": 0.1749224787804739,
+        "ndcg": 0.2320279927165944
+      },
+      "seconds": 64.8914315700531
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.2688681438638248,
+      "val_loss": 0.1025686735392968,
+      "val_metrics": {
+        "hr": 0.44252471349838157,
+        "mrr": 0.18247342691297916,
+        "ndcg": 0.24294189570604632
+      },
+      "seconds": 63.686084270477295
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.26211345689744575,
+      "val_loss": 0.10798213561145513,
+      "val_metrics": {
+        "hr": 0.45779646825049675,
+        "mrr": 0.19083576201379515,
+        "ndcg": 0.2529156559184081
+      },
+      "seconds": 64.73275184631348
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.2573113375698389,
+      "val_loss": 0.10454454287129243,
+      "val_metrics": {
+        "hr": 0.4662884137120862,
+        "mrr": 0.19385999532695034,
+        "ndcg": 0.25721528988174613
+      },
+      "seconds": 68.02311277389526
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.25418295408652614,
+      "val_loss": 0.11017323992483924,
+      "val_metrics": {
+        "hr": 0.4648762138045665,
+        "mrr": 0.19282990938894573,
+        "ndcg": 0.256108036993778
+      },
+      "seconds": 69.71909284591675
+    }
+  ],
+  "timestamp": "2026-08-31 18:05:28.427407"
+}
